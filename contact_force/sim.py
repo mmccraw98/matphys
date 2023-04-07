@@ -1180,9 +1180,36 @@ def simulate_fluid(Gg, Ge, Tau, v, eta, v_tip, h0, R, p_func, *args, nr=int(1e3)
     return data
 
 class ContactSim:
+    """parent class for the contact simulation for a rigid sphere on a flat, linear elastic or linear viscoelastic semi-infinite half-space
+    with primary assumption that the initial separation and maximum deformation are smaller than the probe radius and that the probe velocity is fixed
+    further, the surface starts at its equilibrium position (i.e. is undeformed)
+    """
     
     def __init__(self, Gg, Ge, Tau, poissons, R, v_tip, h0, h0_target, p_func, *args, nr=int(1e3), dr_factor=1.1, dt_factor=1e-10, nt=int(1e6), log_all=False, pct_log=0.1):
-        # solid parameters
+        """initialize the simulation class with the parameters for the simulation
+
+        Args:
+            Gg (float): instantaneous (glassy) shear modulus of the material
+            Ge (float): equilibrium (rubbery) shear modulus of the material
+            Tau (float): relaxation time of the material
+            poissons (float): poissons ratio of the material
+            R (float): probe radius
+            v_tip (float): velocity of the probe
+            h0 (float): initial separation between the probe and the equilibrium position of the surface
+            h0_target (float): target position of the probe relative to the equilibrium position of the surface
+            p_func (_type_): function that describes the pressure on the surface as a function of the gap height and optional arguments, *args, must
+            return the pressure and the derivative of the pressure with respect to the gap height
+            nr (int, optional): number of elements in the radial domain. Defaults to int(1e3).
+            dr_factor (float, optional): multiplying this to the probe radius gives the largest radial distance in the domain. Defaults to 1.1.
+            dt_factor (float, optional): the distance that the probe is advanced per time step. Defaults to 1e-10.
+            nt (int, optional): maximum number of timesteps in the simulation. Defaults to int(1e6).
+            log_all (bool, optional): whether or not to log the field variables. Defaults to False.
+            pct_log (float, optional): frequency of console logging as a percent of the total estimated number of steps. Defaults to 0.1.
+
+        Raises:
+            ValueError: if the target probe position is less than -R/10, the simulation will not be valid
+        """
+        # general solid parameters for the generalized linear viscoelastic ode
         self.b1 = 0
         self.b0 = 0
         self.c1 = 0
@@ -1212,7 +1239,13 @@ class ContactSim:
         self.r = np.linspace(self.dr, nr * self.dr, nr)
         self.k_ij = np.array([K(r_, self.r, self.dr) for r_ in self.r])
         
+        # making the solution variable
+        self.solution = {'data': None, 'Gg': Gg, 'Ge': Ge, 'Tau': Tau, 'poissons': poissons, 'R': R, 'v_tip': v_tip, 'pressure_func': p_func, 
+                         'pressure_func_args': args, 'field_variables': None}
+        
     def make_loggers(self):
+        """make the loggers for the simulation
+        """
         self.force = np.zeros(self.nt)
         self.separation = np.zeros(self.nt)
         self.position = np.zeros(self.nt)
@@ -1220,20 +1253,45 @@ class ContactSim:
         self.time = np.zeros(self.nt)
         
     def make_field_loggers(self):
+        """make the loggers for the field variables
+        """
         self.U = np.zeros((self.nt, self.r.size))
         self.H = np.zeros((self.nt, self.r.size))
         self.P = np.zeros((self.nt, self.r.size))
-        # add P_fluid for iterative solver!
         
     def calculate_gap(self, u, h0):
+        """calculate the gap height as a function of the deformation and the separataion between the spherical probe and the equilibrium position of the surface
+
+        Args:
+            u (numpy array): deformation
+            h0 (numpy array): separataion between the probe and the equilibrium position of the surface
+
+        Returns:
+            numpy array: gap height
+        """
         return h0 + self.r ** 2 / (2 * self.R) - u
     
     def calculate_force(self, pressure):
+        """calculate the force on the surface as a function of the pressure, if the pressure on the surface does not vary with the gap height,
+        this calculation gives the force on the probe as well.  for most surface forces, this is fine - this includes the fluid lubrication force
+        using the reynolds equation
+
+        Args:
+            pressure (numpy array): pressure profile on the surface
+
+        Returns:
+            float: force (positive if repulsive, negative if attractive)
+        """
         return 2 * np.pi * self.r @ pressure * self.dr
     
     def console_log(self, step):
+        """log the simulation to the console at the specified step
+
+        Args:
+            step (int): current simulation step
+        """
         if step % int((self.h0_init - self.h0_target) / (self.v_tip * self.dt) * self.pct_log) == 0:
-            print('step: {} | h0: {:.1f} (nm) | h0_target: {:.1f} (nm) | force: {:.1f} (nN) | separation: {:.1f} (nm)'.format(step, self.h0 * 1e9, self.h0_target * 1e9, self.force[step] * 1e9, self.separation[step] * 1e9))
+            print('step: {} | h0: {:.1f} (nm) | h0_target: {:.1f} (nm) | force: {:.1f} (nN) | separation: {:.1f} (nm) | time: {:.3f} (s)'.format(step, self.h0 * 1e9, self.h0_target * 1e9, self.force[step] * 1e9, self.separation[step] * 1e9, self.time[step]))
         
     def solve(self):
         raise NotImplementedError
@@ -1241,6 +1299,36 @@ class ContactSim:
 class ContactSimIter(ContactSim):
     
     def __init__(self, Gg, Ge, Tau, poissons, eta, R, v_tip, h0, h0_target, p_func, *args, nr=int(1e3), dr_factor=1.1, dt_factor=1e-10, nt=int(1e6), log_all=False, pct_log=0.1):
+        """ITERATIVELY solve the COUPLED PDEs for the interaction of a rigid, spherical probe with a NEWTONIAN FLUID lubricating a semi-infinite, 
+        linear elastic or linear viscoelastic half-space.  the fluid iteration is inspired by the solution of Davis, Serayssol, and Hinch as well as Wang and Frechette,
+        the solid iteration is reappropraited from our generalized ode solution that is used in the explicit ode solver
+        The primary assumption is that the initial separation and the maximum deformation are smaller than the probe radius, so that the Derjaguin
+        approximation is valid for the surface forces and the lubrication approximation (Reynolds equation) is valid for the fluid forces.  Both of these
+        allow the force on the probe to be calculated as the integral of the pressure on the surface
+
+        Args:
+            Gg (float): instantaneous (glassy) shear modulus of the surface
+            Ge (float): equilibrium (rubbery) shear modulus of the surface
+            Tau (float): relaxation time of the surface
+            poissons (float): poissons ratio of the surface
+            eta (float): viscosity of the fluid
+            R (float): radius of the probe
+            v_tip (float): tip velocity
+            h0 (float): separation between the probe and the equilibrium position of the surface at r=0 (i.e. global position of the tip of the probe)
+            h0_target (float): target position of the tip of the probe
+            p_func (_type_): function used to calculate the pressure on the surface with optional args, must be of the form p_func(h, *args) and return a tuple
+            of the pressure and the derivative of the pressure with respect to the gap height
+            nr (int, optional): number of points in the domain. Defaults to int(1e3).
+            dr_factor (float, optional): this multiplied with the probe radius gives the maximum radial distance in the domain. Defaults to 1.1.
+            dt_factor (float, optional): distance traveled by the probe per time step. Defaults to 1e-10.
+            nt (int, optional): maximum number of time steps. Defaults to int(1e6).
+            log_all (bool, optional): whether to log field variables. Defaults to False.
+            pct_log (float, optional): defines frequency of console logging as a percent of the total estimated number of steps. Defaults to 0.1.
+
+        Raises:
+            ValueError: if the target probe position is less than -R/10, the simulation will not be valid
+            ValueError: if the moduli are non-physical, i.e. Gg < Ge or negative
+        """
         super().__init__(Gg, Ge, Tau, poissons, R, v_tip, h0, h0_target, p_func, *args, nr=nr, dr_factor=dr_factor, dt_factor=dt_factor, nt=nt, log_all=log_all, pct_log=pct_log)
         # get solid parameters for the iterative solver protocol
         if Ge == 0 and Tau == 0:  # elastic case
@@ -1257,12 +1345,18 @@ class ContactSimIter(ContactSim):
             raise ValueError('invalid moduli')
         
         self.eta = eta
+        self.solution.update({'eta': eta})
         
         # self explanatory warning
         if self.r[-1] < self.R * (1 / 5) ** (1 / 2):
             print('there might be an issue when indenting due to the brenner asymptotic correction')
     
     def make_loggers(self, state):
+        """make loggers for the simulation
+
+        Args:
+            state (numpy array): state vector of the iterator
+        """
         self.force = np.zeros(self.nt)
         self.separation = np.zeros(self.nt)
         self.position = np.zeros(self.nt)
@@ -1272,28 +1366,70 @@ class ContactSimIter(ContactSim):
         self.iters = np.zeros(self.nt)
     
     def make_field_loggers(self):
+        """make loggers for the field variables
+        """
         self.U = np.zeros((self.nt, self.r.size))
         self.H = np.zeros((self.nt, self.r.size))
         self.P = np.zeros((self.nt, self.r.size))
         self.P_fluid = np.zeros((self.nt, self.r.size))
     
     def calc_fluid_pressure(self, h0, h, h_dot):
+        """calculate the fluid pressure by rearranging the Reynolds equation and integrating twice, two boundary conditions are required
+        the first is due to the symmetry of the problem, the second is estimated using the brenner pressure solution as an estimate of the asymptotic
+        behavior of the fluid pressure at r[-1], this could cause issues if the deformation is large. it improves the accuracy as the fluid pressure
+        is fat-tailed, so if we enforced p_fluid(r[-1])=0, as is common, we would underpredict the pressure at large r
+
+        Args:
+            h0 (float): equilibrium separation between the probe and the surface
+            h (numpy array): gap height
+            h_dot (numpy array): gap velocity
+
+        Returns:
+            numpy array: pressure on the surface due to the fluid
+        """
+        # perform the first integration, using initial=0 as the integrating constant from the symmetry boundary condition of dp_fluid/dr = 0 at r=0
         interm1 = cumtrapz(12 * self.eta * self.r * h_dot, self.r, initial=0)
+        # perform the second integration, arbitrarily set to start at 0, then add the asymptotic correction
         p_fluid = cumtrapz(interm1 / (self.r * h ** 3), self.r, initial=0)
-        # this is the reason for the innacuracy of the fluid solution when the domain is small
-        # we are applying the r=inf boundary condition to the fluid solution at a finite r
-        # this could be alleviated by using an asymptotic solution for the fluid pressure
-        # or maybe a larger domain for the fluid solution
+        # using the typical method of implementing the boundary condition of p_fluid(inf)=0, we say p_fluid(r[-1])=0
         p_fluid -= p_fluid[-1]  # old way
+        # add the asymptotic correction for p_fluid(r[-1])=p_brenner(r[-1])
         p_fluid += p_brenner(h0 + self.r[-1] ** 2 / (2 * self.R), self.v_tip, self.eta, self.R)[0]  # assuming p_brenner returns a tuple!!!!!!!!!!
         return p_fluid
     
     def calc_viscoelastic_deformation(self, u_prev, p, p_dot):
+        """calculate the viscoelastic deformation using the iterative solver protocol,
+        obtained by applying the viscoelastic-elastic correspondence principle to the Attard elastic equation (deformation of elastic half-space due to 
+        arbitrary pressure) after first taking the equation into the frequency domain, then applying the arbitrary ODE definition of linear viscoelastic behavior
+        and inserting it for the complex compliance (or complex modulus) of the material, then inverting back into the time domain to obtain the generalized ODE:
+        b1 u_dot(t) + b0 u(t) = -c1 I(p_dot(t)) - c0 I(p(t))
+        expanding the derivative with forward finite differences: u_dot(t)=(u(t+dt)-u(t))/dt
+        inserting into the ODE and rearranging gives:
+        u(t+dt) = (-c1 I(p_dot(t)) - c0 I(p(t)) + b1 u(t)/dt) / (b0 + b1/dt)
+
+        Args:
+            u_prev (numpy array): previous deformation
+            p (numpy array): pressure on the surface
+            p_dot (numpy array): time derivative of the pressure on the surface
+
+        Returns:
+            numpy array: viscoealstic deformation at the next step
+        """
         I0 = (p * self.r) @ self.k_ij * self.dr
         I1 = (p_dot * self.r) @ self.k_ij * self.dr
         return (-self.c1 * I1 - self.c0 * I0 + self.b1 * u_prev / self.dt) / (self.b0 + self.b1 / self.dt)
     
     def brenner_asymptotic_force_finite_domain_correction(self, h0):
+        """order of magnitude correction factor for the part of the domain for r[-1] to infinity, obtained by assuming the deformation is 0 beyond r[-1], 
+        and integrating the brenner pressure from r[-1] to infinity. this can cause issues if the probe is indented beyond (1/5)^(1/2) * R, 
+        it is useful as the pressure is fat-tailed, so if we enforced p_fluid(r[-1])=0, as is common, we would lose the force contribution from the fluid at large r
+
+        Args:
+            h0 (float): equilibrium separation between the probe and the surface
+
+        Returns:
+            float: force correction
+        """
         # obtained by assuming deformation is 0 at r_max and solving for the pressure using the
         # brenner solution for the fluid pressure and then integrating the brenner pressure
         # from r_max to infinity in the force integral to obtain the correction
@@ -1312,7 +1448,6 @@ class ContactSimIter(ContactSim):
             max_iter (int, optional): maximum number of convergence iterations. Defaults to 100.
             wf (float, optional): mixing ratio within (0,1). values closer to 1 gives slower convergence
             but more accurate results. Defaults to 0.5.
-
         Returns:
             (numpy array of numpy arrays, numpy array, int): 
             (u, u_dot, h, h_dot, p_fluid, p_fluid_dot, p_surface, p_surface_dot at the next time step t+dt),
@@ -1320,7 +1455,7 @@ class ContactSimIter(ContactSim):
             (number of iterations)
         """
         state_n_guess_new = state_n_guess.copy()
-        u, u_dot, h, h_dot, p_fluid, p_fluid_dot, p_surface, p_surface_dot = state
+        u, u_dot, h, h_dot, p_fluid, p_fluid_dot, p_surface, p_surface_dot = state  # a lot of these are not used, but are here for clarity and future use
         err = np.ones(state.shape[0]) * np.inf
         num_iter = 0
         while num_iter < max_iter and np.any(err > err_tol):
@@ -1355,8 +1490,16 @@ class ContactSimIter(ContactSim):
         return state_n_guess, err, num_iter
     
     def solve(self, wf=0.5, err_tol=1e-10, max_iter=100):
-        # save local arguments for later analysis
-        saved_args = locals()
+        """solve the coupled viscoelastic and fluid field equations and generate a force curve
+
+        Args:
+            wf (float, optional): mixing ratio for the iteration update, larger is more accurate but slower. Defaults to 0.5.
+            err_tol (float, optional): convergence tolerance for the iteration. Defaults to 1e-10.
+            max_iter (int, optional): maximum number of iterations, larger is more accurate but slower. Defaults to 100.
+
+        Returns:
+            dict: solution dict containing all the relevant information
+        """
         # log fields if necessary
         if self.log_all:
             self.make_field_loggers()
@@ -1397,6 +1540,7 @@ class ContactSimIter(ContactSim):
             self.separation[i] = state[2][0]
             self.errors[i] = err
             self.iters[i] = n_iter
+            self.time[i] = i * self.dt
             # log to console
             self.console_log(i)
             # log fields if necessary
@@ -1424,16 +1568,47 @@ class ContactSimIter(ContactSim):
                 break
         # return solution data
         sol_df = pd.DataFrame({'time': self.time, 'force': self.force, 'deformation': self.deformation, 'position': self.position, 'separation': self.separation, 
-                               'error': self.errors, 'iterations': self.iters})
-        self.solution = {'data': sol_df, 'args': saved_args, 'field_variables': 0}
+                               'iterations': self.iters, 'conv_u': self.errors[:, 0], 'conv_u_dot': self.errors[:, 1], 'conv_h': self.errors[:, 2],
+                               'conv_h_dot': self.errors[:, 3], 'conv_p_fluid': self.errors[:, 4], 'conv_p_fluid_dot': self.errors[:, 5],
+                               'conv_p_surface': self.errors[:, 6], 'conv_p_surface_dot': self.errors[:, 7]})
+        self.solution['data'] = sol_df
         if self.log_all:
-            self.solution['field_variables'] = {'U': self.U, 'H': self.H, 'P': self.P, 'P_fluid': self.P_fluid}
+            self.solution['field_variables'] = {'U': self.U, 'H': self.H, 'P': self.P, 'P_fluid': self.P_fluid, 'r': self.r, 't': self.time}
         print('done! returning solution, it is also saved as self.solution')
         return self.solution
     
+     
 class ContactSimOde(ContactSim):
     
     def __init__(self, Gg, Ge, Tau, poissons, R, v_tip, h0, h0_target, p_func, *args, nr=int(1e3), dr_factor=1.1, dt_factor=1e-10, nt=int(1e6), log_all=False, pct_log=0.1):
+        """solve the solid PDE using an explicit time stepping routine for the itneraction of a rigid, spherical probe with a semi-infinite,
+        linear elastic or linear viscoelastic half-space.  the scheme is based on a generalization of Attard's equation and Rajabifar's solution
+        The primary assumption is that the initial separation and the maximum deformation are smaller than the probe radius, so that the Derjaguin
+        approximation is valid for the surface forces and the lubrication approximation (Reynolds equation) is valid for the fluid forces.  Both of these
+        allow the force on the probe to be calculated as the integral of the pressure on the surface
+
+        Args:
+            Gg (float): instantaneous (glassy) shear modulus of the surface
+            Ge (float): equilibrium (rubbery) shear modulus of the surface
+            Tau (float): relaxation time of the surface
+            poissons (float): poissons ratio of the surface
+            R (float): radius of the probe
+            v_tip (float): tip velocity
+            h0 (float): separation between the probe and the equilibrium position of the surface at r=0 (i.e. global position of the tip of the probe)
+            h0_target (float): target position of the tip of the probe
+            p_func (_type_): function used to calculate the pressure on the surface with optional args, must be of the form p_func(h, *args) and return a tuple
+            of the pressure and the derivative of the pressure with respect to the gap height
+            nr (int, optional): number of points in the domain. Defaults to int(1e3).
+            dr_factor (float, optional): this multiplied with the probe radius gives the maximum radial distance in the domain. Defaults to 1.1.
+            dt_factor (float, optional): distance traveled by the probe per time step. Defaults to 1e-10.
+            nt (int, optional): maximum number of time steps. Defaults to int(1e6).
+            log_all (bool, optional): whether to log field variables. Defaults to False.
+            pct_log (float, optional): defines frequency of console logging as a percent of the total estimated number of steps. Defaults to 0.1.
+
+        Raises:
+            ValueError: if the target probe position is less than -R/10, the simulation will not be valid
+            ValueError: if the moduli are non-physical, i.e. Gg < Ge or negative
+        """        
         super().__init__(Gg, Ge, Tau, poissons, R, v_tip, h0, h0_target, p_func, *args, nr=nr, dr_factor=dr_factor, dt_factor=dt_factor, nt=nt, log_all=log_all, pct_log=pct_log)
         # get solid parameters for the ode solver protocol
         if Ge == 0 and Tau == 0:  # elastic case
@@ -1453,6 +1628,14 @@ class ContactSimOde(ContactSim):
         self.I = np.eye(self.r.size)
 
     def rhs(self, state):
+        """calculate the right hand side of the solid ODE
+
+        Args:
+            state (numpy array): deformation and separation between the probe and the equilibrium position of the surface at r=0 (i.e. global position of the tip of the probe)
+
+        Returns:
+            numpy array: derivative of state vector (deformation rate, probe velocity)
+        """
         # unpack state
         u, h0 = state
         # calculate gap
@@ -1468,6 +1651,14 @@ class ContactSimOde(ContactSim):
         return np.array([u_dot, self.v_tip], dtype=object), (p, h)
     
     def rk4(self, state):
+        """4th order Runge-Kutta time stepping scheme
+
+        Args:
+            state (numpy array): state vector (deformation, separation in our case)
+
+        Returns:
+            numpy array: state vector derivative (deformation rate, probe velocity in our case), extra values from rhs calculation (pressure, gap in our case)
+        """
         k1, _ = self.rhs(state)
         k2, _ = self.rhs(state + k1 * self.dt / 2)
         k3, _ = self.rhs(state + k2 * self.dt / 2)
@@ -1475,8 +1666,11 @@ class ContactSimOde(ContactSim):
         return state + (k1 + 2 * k2 + 2 * k3 + k4) * self.dt / 6, extra
     
     def solve(self):
-        # save local arguments for later analysis
-        saved_args = locals()
+        """solve the solid ODE using the explicit time stepping routine
+
+        Returns:
+            dict: solution dict containing all the relevant information
+        """
         # make loggers
         self.make_loggers()
         # log fields if necessary
@@ -1518,9 +1712,8 @@ class ContactSimOde(ContactSim):
                 break
         # return solution data
         sol_df = pd.DataFrame({'time': self.time, 'force': self.force, 'deformation': self.deformation, 'position': self.position, 'separation': self.separation})
-        self.solution = {'data': sol_df, 'args': saved_args, 'field_variables': 0}
+        self.solution['data'] = sol_df
         if self.log_all:
-            self.solution['field_variables'] = {'U': self.U, 'H': self.H, 'P': self.P}
+            self.solution['field_variables'] = {'U': self.U, 'H': self.H, 'P': self.P, 'r': self.r, 't': self.time}
         print('done! returning solution, it is also saved as self.solution')
         return self.solution
-    
