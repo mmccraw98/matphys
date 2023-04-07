@@ -1423,7 +1423,8 @@ class ContactSimIter(ContactSim):
                     self.P_fluid = self.P_fluid[:i]
                 break
         # return solution data
-        sol_df = pd.DataFrame({'time': self.time, 'force': self.force, 'deformation': self.deformation, 'position': self.position, 'separation': self.separation})
+        sol_df = pd.DataFrame({'time': self.time, 'force': self.force, 'deformation': self.deformation, 'position': self.position, 'separation': self.separation, 
+                               'error': self.errors, 'iterations': self.iters})
         self.solution = {'data': sol_df, 'args': saved_args, 'field_variables': 0}
         if self.log_all:
             self.solution['field_variables'] = {'U': self.U, 'H': self.H, 'P': self.P, 'P_fluid': self.P_fluid}

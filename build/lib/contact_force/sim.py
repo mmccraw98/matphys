@@ -4,6 +4,7 @@ import pandas as pd
 import torch
 import time as time_
 from contact_force.funcs import hertzian
+from scipy.integrate import cumtrapz
 
 def In_L(r_n, dr):
     '''
@@ -1177,3 +1178,348 @@ def simulate_fluid(Gg, Ge, Tau, v, eta, v_tip, h0, R, p_func, *args, nr=int(1e3)
     df = pd.DataFrame({'time': time, 'separation': separation, 'position': position, 'force': force, 'deformation': deformation, 'force_fluid': force_fluid})
     data = {'df': df, 'sim_arguments': saved_args, 'log_all': {'u': U_log, 'p': P_log, 'r': r, 'p_fluid': P_fluid_log}}
     return data
+
+class ContactSim:
+    
+    def __init__(self, Gg, Ge, Tau, poissons, R, v_tip, h0, h0_target, p_func, *args, nr=int(1e3), dr_factor=1.1, dt_factor=1e-10, nt=int(1e6), log_all=False, pct_log=0.1):
+        # solid parameters
+        self.b1 = 0
+        self.b0 = 0
+        self.c1 = 0
+        self.c0 = 0
+        
+        # logging field equations, usually not on
+        self.log_all = log_all
+        self.pct_log = pct_log
+        
+        # get probe parameters
+        self.R = R
+        self.v_tip = v_tip
+        self.h0 = h0
+        self.h0_init = h0
+        if h0_target < - self.R / 10:
+            raise ValueError('h0_target must be greater than -R/10')
+        self.h0_target = h0_target
+        
+        # get pressure function parameters
+        self.p_func = p_func
+        self.args = args
+        
+        # define simulation variables
+        self.dr = dr_factor * self.R / nr  # INCREASE THIS TO INCREASE THE ACCURACY OF THE FLUID SOLUTION
+        self.dt = abs(dt_factor / self.v_tip)  # decrease this to reduce the error in the time step
+        self.nt = nt
+        self.r = np.linspace(self.dr, nr * self.dr, nr)
+        self.k_ij = np.array([K(r_, self.r, self.dr) for r_ in self.r])
+        
+    def make_loggers(self):
+        self.force = np.zeros(self.nt)
+        self.separation = np.zeros(self.nt)
+        self.position = np.zeros(self.nt)
+        self.deformation = np.zeros(self.nt)
+        self.time = np.zeros(self.nt)
+        
+    def make_field_loggers(self):
+        self.U = np.zeros((self.nt, self.r.size))
+        self.H = np.zeros((self.nt, self.r.size))
+        self.P = np.zeros((self.nt, self.r.size))
+        # add P_fluid for iterative solver!
+        
+    def calculate_gap(self, u, h0):
+        return h0 + self.r ** 2 / (2 * self.R) - u
+    
+    def calculate_force(self, pressure):
+        return 2 * np.pi * self.r @ pressure * self.dr
+    
+    def console_log(self, step):
+        if step % int((self.h0_init - self.h0_target) / (self.v_tip * self.dt) * self.pct_log) == 0:
+            print('step: {} | h0: {:.1f} (nm) | h0_target: {:.1f} (nm) | force: {:.1f} (nN) | separation: {:.1f} (nm)'.format(step, self.h0 * 1e9, self.h0_target * 1e9, self.force[step] * 1e9, self.separation[step] * 1e9))
+        
+    def solve(self):
+        raise NotImplementedError
+    
+class ContactSimIter(ContactSim):
+    
+    def __init__(self, Gg, Ge, Tau, poissons, eta, R, v_tip, h0, h0_target, p_func, *args, nr=int(1e3), dr_factor=1.1, dt_factor=1e-10, nt=int(1e6), log_all=False, pct_log=0.1):
+        super().__init__(Gg, Ge, Tau, poissons, R, v_tip, h0, h0_target, p_func, *args, nr=nr, dr_factor=dr_factor, dt_factor=dt_factor, nt=nt, log_all=log_all, pct_log=pct_log)
+        # get solid parameters for the iterative solver protocol
+        if Ge == 0 and Tau == 0:  # elastic case
+            self.b1 = 0
+            self.b0 = Gg
+            self.c1 = 0
+            self.c0 = (1 - poissons ** 2)
+        elif Ge > 0 and Tau > 0 and Ge <= Gg:  # viscoelastic case
+            self.b1 = Gg * Tau
+            self.b0 = Ge
+            self.c1 = (1 - poissons ** 2) * Tau
+            self.c0 = (1 - poissons ** 2)
+        else:  # invalid case
+            raise ValueError('invalid moduli')
+        
+        self.eta = eta
+        
+        # self explanatory warning
+        if self.r[-1] < self.R * (1 / 5) ** (1 / 2):
+            print('there might be an issue when indenting due to the brenner asymptotic correction')
+    
+    def make_loggers(self, state):
+        self.force = np.zeros(self.nt)
+        self.separation = np.zeros(self.nt)
+        self.position = np.zeros(self.nt)
+        self.deformation = np.zeros(self.nt)
+        self.time = np.zeros(self.nt)
+        self.errors = np.zeros((self.nt, state.shape[0]))
+        self.iters = np.zeros(self.nt)
+    
+    def make_field_loggers(self):
+        self.U = np.zeros((self.nt, self.r.size))
+        self.H = np.zeros((self.nt, self.r.size))
+        self.P = np.zeros((self.nt, self.r.size))
+        self.P_fluid = np.zeros((self.nt, self.r.size))
+    
+    def calc_fluid_pressure(self, h0, h, h_dot):
+        interm1 = cumtrapz(12 * self.eta * self.r * h_dot, self.r, initial=0)
+        p_fluid = cumtrapz(interm1 / (self.r * h ** 3), self.r, initial=0)
+        # this is the reason for the innacuracy of the fluid solution when the domain is small
+        # we are applying the r=inf boundary condition to the fluid solution at a finite r
+        # this could be alleviated by using an asymptotic solution for the fluid pressure
+        # or maybe a larger domain for the fluid solution
+        p_fluid -= p_fluid[-1]  # old way
+        p_fluid += p_brenner(h0 + self.r[-1] ** 2 / (2 * self.R), self.v_tip, self.eta, self.R)[0]  # assuming p_brenner returns a tuple!!!!!!!!!!
+        return p_fluid
+    
+    def calc_viscoelastic_deformation(self, u_prev, p, p_dot):
+        I0 = (p * self.r) @ self.k_ij * self.dr
+        I1 = (p_dot * self.r) @ self.k_ij * self.dr
+        return (-self.c1 * I1 - self.c0 * I0 + self.b1 * u_prev / self.dt) / (self.b0 + self.b1 / self.dt)
+    
+    def brenner_asymptotic_force_finite_domain_correction(self, h0):
+        # obtained by assuming deformation is 0 at r_max and solving for the pressure using the
+        # brenner solution for the fluid pressure and then integrating the brenner pressure
+        # from r_max to infinity in the force integral to obtain the correction
+        return -12 * self.eta * self.v_tip * self.R ** 3 / (self.r[-1] ** 2 + 2 * h0 * self.R)
+    
+    def viscoelastic_fluid_iterator(self, state, state_n_guess, h0, h0_n, err_tol=1e-10, max_iter=100, wf=0.5):
+        """use iteration to solve the coupled viscoelastic and fluid field equations
+        n denotes the value calculated at the next time step i.e. t+dt
+        
+        Args:
+            state (numpy array of numpy arrays): u, u_dot, h, h_dot, p_fluid, p_fluid_dot, p_surface, p_surface_dot
+            state_n_guess (numpy array of numpy arrays): the guess for the state vector at the next time step
+            h0 (float): current position of the probe
+            h0_n (float): position of the probe at time t+dt
+            err_tol (float, optional): convergence tolerance for iteration. Defaults to 1e-10.
+            max_iter (int, optional): maximum number of convergence iterations. Defaults to 100.
+            wf (float, optional): mixing ratio within (0,1). values closer to 1 gives slower convergence
+            but more accurate results. Defaults to 0.5.
+
+        Returns:
+            (numpy array of numpy arrays, numpy array, int): 
+            (u, u_dot, h, h_dot, p_fluid, p_fluid_dot, p_surface, p_surface_dot at the next time step t+dt),
+            (convergence error at final iteration),
+            (number of iterations)
+        """
+        state_n_guess_new = state_n_guess.copy()
+        u, u_dot, h, h_dot, p_fluid, p_fluid_dot, p_surface, p_surface_dot = state
+        err = np.ones(state.shape[0]) * np.inf
+        num_iter = 0
+        while num_iter < max_iter and np.any(err > err_tol):
+            num_iter += 1
+            # get the values from the state guess
+            u_n, u_n_dot, h_n, h_n_dot, p_fluid_n, p_fluid_dot_n, p_surface_n, p_surface_dot_n = state_n_guess
+            # calculate the new fluid pressure using the guess for h and h_dot at the next time step
+            p_fluid_n_new = self.calc_fluid_pressure(self.h0, h_n, h_n_dot)
+            # calculate the new fluid pressure derivative
+            p_fluid_dot_n_new = (p_fluid_n_new - p_fluid) / self.dt
+            # calculate the new surface pressure using the guess for h and h_dot at the next time step
+            p_surface_n_new = self.p_func(h_n, *self.args)[0]  # THIS IS ASSUMING P_FUNC RETURNS A TUPLE!!!!!!!!!!!!!!
+            # calculate the new surface pressure derivative
+            p_surface_dot_n_new = (p_surface_n_new - p_surface) / self.dt
+            # calculate the new total pressure on the surface and its derivative
+            p_n_new = p_fluid_n_new + p_surface_n_new
+            p_dot_n_new = p_fluid_dot_n_new + p_surface_dot_n_new
+            # calculate the new deformation of the elastic surface
+            u_n_new = self.calc_viscoelastic_deformation(u, p_n_new, p_dot_n_new)
+            # calculate the new deformation rate
+            u_dot_n_new = (u_n_new - u) / self.dt
+            # calculate the new gap
+            h_n_new = h0_n + self.r ** 2 / (2 * self.R) - u_n_new
+            # calculate the new gap rate
+            h_dot_n_new = (h0_n - h0) / self.dt - u_dot_n_new
+            # create the new state
+            state_n_guess_new = np.array([u_n_new, u_dot_n_new, h_n_new, h_dot_n_new, p_fluid_n_new, p_fluid_dot_n_new, p_surface_n_new, p_surface_dot_n_new])
+            # determine the convergence
+            err = np.linalg.norm(state_n_guess_new - state_n_guess, axis=1)
+            # update the state guess using mixing rule
+            state_n_guess = wf * state_n_guess + (1 - wf) * state_n_guess_new
+        return state_n_guess, err, num_iter
+    
+    def solve(self, wf=0.5, err_tol=1e-10, max_iter=100):
+        # save local arguments for later analysis
+        saved_args = locals()
+        # log fields if necessary
+        if self.log_all:
+            self.make_field_loggers()
+        # initialize starting state
+        u = np.zeros(self.r.shape)
+        h = self.calculate_gap(u, self.h0)
+        p_fluid, p_fluid_h = p_brenner(h, self.v_tip, self.eta, self.R)
+        p_surface, p_surface_h = self.p_func(h, *self.args)
+        state = np.array([u, u * 0, h, self.v_tip + u * 0, p_fluid, p_fluid_h * self.v_tip, p_surface, p_surface_h * self.v_tip])
+        # initialize previous state
+        h_prev = self.calculate_gap(u, self.h0 - self.v_tip * self.dt)
+        p_fluid, p_fluid_h = p_brenner(h_prev, self.v_tip, self.eta, self.R)
+        p_surface, p_surface_h = self.p_func(h_prev, *self.args)
+        state_prev = np.array([u, u * 0, h_prev, self.v_tip + u * 0, p_fluid, p_fluid_h * self.v_tip, p_surface, p_surface_h * self.v_tip])
+        # make loggers
+        self.make_loggers(state)
+        # loop
+        for i in range(self.nt):
+            # use the update rule to estimate the next state (it is done by equating forward
+            # and backward differences at a fixed time and rearranging to find state(t+dt)
+            # due to state(t) and state(t-dt))
+            state_next_guess = 2 * state - state_prev
+            # iterate to refine the guess of the next state
+            state_next, err, n_iter = self.viscoelastic_fluid_iterator(state, state_next_guess, self.h0, self.h0 + self.v_tip * self.dt, err_tol, max_iter, wf)
+            # update the previous state
+            state_prev = state.copy()
+            state = state_next.copy()
+            # calculate observables
+            total_pressure = state[6] + state[4]
+            self.force[i] = self.calculate_force(total_pressure)
+            # this is a small correction (about an order of magnitude) but it could introduce
+            # an error when h0 is negative and h0 * R * 2 passes beyond r_max
+            # if the maximum indentation depth (min value of h0) is limited to -R/10, then this gives
+            # a criterion of r_max > ~R/2 which is ok
+            self.force[i] += self.brenner_asymptotic_force_finite_domain_correction(self.h0)
+            self.deformation[i] = state[0][0]
+            self.position[i] = self.h0 + self.v_tip * self.dt
+            self.separation[i] = state[2][0]
+            self.errors[i] = err
+            self.iters[i] = n_iter
+            # log to console
+            self.console_log(i)
+            # log fields if necessary
+            if self.log_all:
+                self.U[i] = state[0]
+                self.H[i] = state[2]
+                self.P[i] = state[6] + state[4]
+                self.P_fluid[i] = state[4]
+            # advance the probe for the next time step
+            self.h0 += self.v_tip * self.dt
+            # early stopping conditions
+            if self.h0 <= self.h0_target:
+                self.force = self.force[:i]
+                self.deformation = self.deformation[:i]
+                self.position = self.position[:i]
+                self.separation = self.separation[:i]
+                self.time = self.time[:i]
+                self.errors = self.errors[:i]
+                self.iters = self.iters[:i]
+                if self.log_all:
+                    self.U = self.U[:i]
+                    self.H = self.H[:i]
+                    self.P = self.P[:i]
+                    self.P_fluid = self.P_fluid[:i]
+                break
+        # return solution data
+        sol_df = pd.DataFrame({'time': self.time, 'force': self.force, 'deformation': self.deformation, 'position': self.position, 'separation': self.separation})
+        self.solution = {'data': sol_df, 'args': saved_args, 'field_variables': 0}
+        if self.log_all:
+            self.solution['field_variables'] = {'U': self.U, 'H': self.H, 'P': self.P, 'P_fluid': self.P_fluid}
+        print('done! returning solution, it is also saved as self.solution')
+        return self.solution
+    
+class ContactSimOde(ContactSim):
+    
+    def __init__(self, Gg, Ge, Tau, poissons, R, v_tip, h0, h0_target, p_func, *args, nr=int(1e3), dr_factor=1.1, dt_factor=1e-10, nt=int(1e6), log_all=False, pct_log=0.1):
+        super().__init__(Gg, Ge, Tau, poissons, R, v_tip, h0, h0_target, p_func, *args, nr=nr, dr_factor=dr_factor, dt_factor=dt_factor, nt=nt, log_all=log_all, pct_log=pct_log)
+        # get solid parameters for the ode solver protocol
+        if Ge == 0 and Tau == 0:  # elastic case
+            self.b1 = Gg
+            self.b0 = 0
+            self.c1 = (1 - poissons ** 2)
+            self.c0 = 0
+        elif Ge > 0 and Tau > 0 and Ge <= Gg:  # viscoelastic case
+            self.b1 = Gg * Tau
+            self.b0 = Ge
+            self.c1 = (1 - poissons ** 2) * Tau
+            self.c0 = (1 - poissons ** 2)
+        else:  # who knows?
+            raise ValueError('invalid moduli')
+        
+        # define the identity matrix for use as dirac delta kernel
+        self.I = np.eye(self.r.size)
+
+    def rhs(self, state):
+        # unpack state
+        u, h0 = state
+        # calculate gap
+        h = self.calculate_gap(u, h0)
+        # calculate pressure and derivative
+        p, p_h = self.p_func(h, *self.args)
+        # calculate lhs integral operator as a matrix
+        lhs = self.c1 * self.dr * self.k_ij * p_h * self.r - self.b1 * self.I
+        # calculate the rhs source term
+        rhs = self.c1 * self.v_tip * self.dr * (p_h * self.r) @ self.k_ij + self.c0 * self.dr * (p * self.r) @ self.k_ij + self.b0 * u
+        # invert the equation to obtain the derivative of u
+        u_dot = np.linalg.solve(lhs, rhs)
+        return np.array([u_dot, self.v_tip], dtype=object), (p, h)
+    
+    def rk4(self, state):
+        k1, _ = self.rhs(state)
+        k2, _ = self.rhs(state + k1 * self.dt / 2)
+        k3, _ = self.rhs(state + k2 * self.dt / 2)
+        k4, extra = self.rhs(state + k3 * self.dt)
+        return state + (k1 + 2 * k2 + 2 * k3 + k4) * self.dt / 6, extra
+    
+    def solve(self):
+        # save local arguments for later analysis
+        saved_args = locals()
+        # make loggers
+        self.make_loggers()
+        # log fields if necessary
+        if self.log_all:
+            self.make_field_loggers()
+        # make solid deformation field
+        u = np.zeros(self.r.size)
+        # make state
+        state = np.array([u, self.h0], dtype=object)
+        # loop
+        for i in range(self.nt):
+            # update state
+            state, (p, h) = self.rk4(state)
+            u, self.h0 = state
+            # calculate observables
+            self.force[i] = self.calculate_force(p)
+            self.deformation[i] = u[0]
+            self.position[i] = self.h0
+            self.separation[i] = h[0]
+            self.time[i] = i * self.dt
+            # log to console
+            self.console_log(i)
+            # log fields if necessary
+            if self.log_all:
+                self.U[i] = u
+                self.H[i] = h
+                self.P[i] = p
+            # early stopping conditions
+            if self.h0 <= self.h0_target:
+                self.force = self.force[:i]
+                self.deformation = self.deformation[:i]
+                self.position = self.position[:i]
+                self.separation = self.separation[:i]
+                self.time = self.time[:i]
+                if self.log_all:
+                    self.U = self.U[:i]
+                    self.H = self.H[:i]
+                    self.P = self.P[:i]
+                break
+        # return solution data
+        sol_df = pd.DataFrame({'time': self.time, 'force': self.force, 'deformation': self.deformation, 'position': self.position, 'separation': self.separation})
+        self.solution = {'data': sol_df, 'args': saved_args, 'field_variables': 0}
+        if self.log_all:
+            self.solution['field_variables'] = {'U': self.U, 'H': self.H, 'P': self.P}
+        print('done! returning solution, it is also saved as self.solution')
+        return self.solution
+    
