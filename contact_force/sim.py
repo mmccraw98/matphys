@@ -1753,6 +1753,7 @@ class ContactSimOdeFluid(ContactSimOde):
         super().__init__(Gg, Ge, Tau, poissons, R, v_tip, h0, h0_target, p_func, *args, nr=nr, dr_factor=dr_factor, dt_factor=dt_factor, nt=nt, log_all=log_all, pct_log=pct_log)
         # define the fluid viscosity
         self.eta = eta
+        self.solution['eta'] = self.eta
         # making vectors
         self.v_tip = np.ones(self.r.shape) * self.v_tip
         self.h0 = np.ones(self.r.shape) * self.h0
