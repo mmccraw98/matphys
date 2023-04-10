@@ -5,6 +5,7 @@ import torch
 import time as time_
 from contact_force.funcs import hertzian
 from scipy.integrate import cumtrapz
+from scipy.interpolate import splrep, splev
 
 def In_L(r_n, dr):
     '''
@@ -1299,12 +1300,12 @@ class ContactSim:
 class ContactSimIter(ContactSim):
     
     def __init__(self, Gg, Ge, Tau, poissons, eta, R, v_tip, h0, h0_target, p_func, *args, nr=int(1e3), dr_factor=1.1, dt_factor=1e-10, nt=int(1e6), log_all=False, pct_log=0.1):
-        """ITERATIVELY solve the COUPLED PDEs for the interaction of a rigid, spherical probe with a NEWTONIAN FLUID lubricating a semi-infinite, 
-        linear elastic or linear viscoelastic half-space.  the fluid iteration is inspired by the solution of Davis, Serayssol, and Hinch as well as Wang and Frechette,
-        the solid iteration is reappropraited from our generalized ode solution that is used in the explicit ode solver
-        The primary assumption is that the initial separation and the maximum deformation are smaller than the probe radius, so that the Derjaguin
-        approximation is valid for the surface forces and the lubrication approximation (Reynolds equation) is valid for the fluid forces.  Both of these
-        allow the force on the probe to be calculated as the integral of the pressure on the surface
+        """use explicit time stepping to ITERATIVELY solve the COUPLED PDEs for the interaction of a rigid, spherical probe with a NEWTONIAN FLUID 
+        lubricating a semi-infinite, linear elastic or linear viscoelastic half-space.  the fluid iteration is inspired by the solution of 
+        Davis, Serayssol, and Hinch as well as Wang and Frechette, the solid iteration is reappropraited from our generalized ode solution that is used in the 
+        implicit ode solver. The primary assumption is that the initial separation and the maximum deformation are smaller than the probe radius, 
+        so that the Derjaguin approximation is valid for the surface forces and the lubrication approximation (Reynolds equation) is valid for the fluid forces.  
+        Both of these allow the force on the probe to be calculated as the integral of the pressure on the surface
 
         Args:
             Gg (float): instantaneous (glassy) shear modulus of the surface
@@ -1490,7 +1491,7 @@ class ContactSimIter(ContactSim):
         return state_n_guess, err, num_iter
     
     def solve(self, wf=0.5, err_tol=1e-10, max_iter=100):
-        """solve the coupled viscoelastic and fluid field equations and generate a force curve
+        """explicitly solve the coupled viscoelastic and fluid field equations and generate a force curve
 
         Args:
             wf (float, optional): mixing ratio for the iteration update, larger is more accurate but slower. Defaults to 0.5.
@@ -1581,7 +1582,7 @@ class ContactSimIter(ContactSim):
 class ContactSimOde(ContactSim):
     
     def __init__(self, Gg, Ge, Tau, poissons, R, v_tip, h0, h0_target, p_func, *args, nr=int(1e3), dr_factor=1.1, dt_factor=1e-10, nt=int(1e6), log_all=False, pct_log=0.1):
-        """solve the solid PDE using an explicit time stepping routine for the itneraction of a rigid, spherical probe with a semi-infinite,
+        """solve the solid PDE using an implicit time stepping routine for the itneraction of a rigid, spherical probe with a semi-infinite,
         linear elastic or linear viscoelastic half-space.  the scheme is based on a generalization of Attard's equation and Rajabifar's solution
         The primary assumption is that the initial separation and the maximum deformation are smaller than the probe radius, so that the Derjaguin
         approximation is valid for the surface forces and the lubrication approximation (Reynolds equation) is valid for the fluid forces.  Both of these
@@ -1666,7 +1667,7 @@ class ContactSimOde(ContactSim):
         return state + (k1 + 2 * k2 + 2 * k3 + k4) * self.dt / 6, extra
     
     def solve(self):
-        """solve the solid ODE using the explicit time stepping routine
+        """solve the solid ODE using the implicit time stepping routine
 
         Returns:
             dict: solution dict containing all the relevant information
@@ -1717,3 +1718,263 @@ class ContactSimOde(ContactSim):
             self.solution['field_variables'] = {'U': self.U, 'H': self.H, 'P': self.P, 'r': self.r, 't': self.time}
         print('done! returning solution, it is also saved as self.solution')
         return self.solution
+    
+class ContactSimOdeFluid(ContactSimOde):
+    
+    def __init__(self, Gg, Ge, Tau, poissons, R, v_tip, h0, h0_target, eta, p_func, *args, nr=int(1e3), dr_factor=1.1, dt_factor=1e-10, nt=int(1e6), log_all=False, pct_log=0.1):
+        """solve the solid PDE using an implicit time stepping routine for the itneraction of a rigid, spherical probe with a semi-infinite,
+        linear elastic or linear viscoelastic half-space.  the scheme is based on a generalization of Attard's equation and Rajabifar's solution
+        The primary assumption is that the initial separation and the maximum deformation are smaller than the probe radius, so that the Derjaguin
+        approximation is valid for the surface forces and the lubrication approximation (Reynolds equation) is valid for the fluid forces.  Both of these
+        allow the force on the probe to be calculated as the integral of the pressure on the surface
+
+        Args:
+            Gg (float): instantaneous (glassy) shear modulus of the surface
+            Ge (float): equilibrium (rubbery) shear modulus of the surface
+            Tau (float): relaxation time of the surface
+            poissons (float): poissons ratio of the surface
+            R (float): radius of the probe
+            v_tip (float): tip velocity
+            h0 (float): separation between the probe and the equilibrium position of the surface at r=0 (i.e. global position of the tip of the probe)
+            h0_target (float): target position of the tip of the probe
+            p_func (_type_): function used to calculate the pressure on the surface with optional args, must be of the form p_func(h, *args) and return a tuple
+            of the pressure and the derivative of the pressure with respect to the gap height
+            nr (int, optional): number of points in the domain. Defaults to int(1e3).
+            dr_factor (float, optional): this multiplied with the probe radius gives the maximum radial distance in the domain. Defaults to 1.1.
+            dt_factor (float, optional): distance traveled by the probe per time step. Defaults to 1e-10.
+            nt (int, optional): maximum number of time steps. Defaults to int(1e6).
+            log_all (bool, optional): whether to log field variables. Defaults to False.
+            pct_log (float, optional): defines frequency of console logging as a percent of the total estimated number of steps. Defaults to 0.1.
+
+        Raises:
+            ValueError: if the target probe position is less than -R/10, the simulation will not be valid
+            ValueError: if the moduli are non-physical, i.e. Gg < Ge or negative
+        """        
+        super().__init__(Gg, Ge, Tau, poissons, R, v_tip, h0, h0_target, p_func, *args, nr=nr, dr_factor=dr_factor, dt_factor=dt_factor, nt=nt, log_all=log_all, pct_log=pct_log)
+        # define the fluid viscosity
+        self.eta = eta
+        # making vectors
+        self.v_tip = np.ones(self.r.shape) * self.v_tip
+        self.h0 = np.ones(self.r.shape) * self.h0
+
+    def console_log(self, step):
+        """log the simulation to the console at the specified step
+
+        Args:
+            step (int): current simulation step
+        """
+        if step % int((self.h0_init - self.h0_target) / (self.v_tip[0] * self.dt) * self.pct_log) == 0:
+            print('step: {} | h0: {:.1f} (nm) | h0_target: {:.1f} (nm) | force: {:.1f} (nN) | separation: {:.1f} (nm) | time: {:.3f} (s)'.format(step, self.h0[0] * 1e9, self.h0_target * 1e9, self.force[step] * 1e9, self.separation[step] * 1e9, self.time[step]))
+  
+
+    def d1(self, f):
+        """first derivative of f, using a 2nd order central difference scheme
+
+        Args:
+            f (np.array): some array
+
+        Returns:
+            np.array: first derivative of f
+        """
+        return (f[2:] - f[:-2]) / (2 * self.dr)
+
+    def calc_fluid_pressure(self, h0, h, h_dot):
+        """calculate the fluid pressure by rearranging the Reynolds equation and integrating twice, two boundary conditions are required
+        the first is due to the symmetry of the problem, the second is estimated using the brenner pressure solution as an estimate of the asymptotic
+        behavior of the fluid pressure at r[-1], this could cause issues if the deformation is large. it improves the accuracy as the fluid pressure
+        is fat-tailed, so if we enforced p_fluid(r[-1])=0, as is common, we would underpredict the pressure at large r
+
+        Args:
+            h0 (float): equilibrium separation between the probe and the surface
+            h (numpy array): gap height
+            h_dot (numpy array): gap velocity
+
+        Returns:
+            numpy array: pressure on the surface due to the fluid
+        """
+        # perform the first integration, using initial=0 as the integrating constant from the symmetry boundary condition of dp_fluid/dr = 0 at r=0
+        interm1 = cumtrapz(12 * self.eta * self.r * h_dot, self.r, initial=0)
+        # perform the second integration, arbitrarily set to start at 0, then add the asymptotic correction
+        p_fluid = cumtrapz(interm1 / (self.r * h ** 3), self.r, initial=0)
+        # using the typical method of implementing the boundary condition of p_fluid(inf)=0, we say p_fluid(r[-1])=0
+        p_fluid -= p_fluid[-1]  # old way
+        # add the asymptotic correction for p_fluid(r[-1])=p_brenner(r[-1])
+        p_fluid += p_brenner(h0 + self.r[-1] ** 2 / (2 * self.R), self.v_tip, self.eta, self.R)[0]  # assuming p_brenner returns a tuple!!!!!!!!!!
+        return p_fluid
+    
+    
+    def calc_fluid_pressure_gradient(self, p_fluid, h):
+        """calculate the gradient of the fluid pressure by differentiating the reynolds equation by h, rearranging, and integrating once
+
+        Args:
+            p_fluid (numpy array): pressure on the surface due to the fluid
+            h (numpy array): gap height
+
+        Returns:
+            numpy array: gradient of the fluid pressure
+        """
+        p_fluid_h_numerical = np.zeros(self.r.shape)
+        p_fluid_h_numerical[1:-1] = -3 * cumtrapz(self.d1(p_fluid) / h[1:-1], self.r[1:-1], initial=0)  # symmetric boundary condition
+        p_fluid_h_numerical[1:-1] -= p_fluid_h_numerical[-2]  # we use -2 and not -1, bc -1 is default 0 due to the .zeros defintion above
+        p_fluid_h_numerical[1:-1] += p_brenner(h, self.v_tip, self.eta, self.R)[1][-1]  # apply brenner pressure asymptote
+        # apply symmetry boundary condition (zero gradient at r=0)
+        p_fluid_h_numerical[0] = p_fluid_h_numerical[1]
+        # use splines to interpolate the boundary at large r
+        spline = splrep(self.r[:-1], p_fluid_h_numerical[:-1])
+        p_fluid_h_numerical[-1] = splev(self.r[-1], spline)
+        return p_fluid_h_numerical
+    
+    
+    def rhs_semi_iter(self, state, h_prev, dt, iterate=False, max_iter=100, tol=1e-6, wf=1):
+        """calculate the right hand side of the solid ODE
+
+        Args:
+            state (numpy array): deformation and separation between the probe and the equilibrium position of the surface at r=0 (i.e. global position of the tip of the probe)
+
+        Returns:
+            numpy array: derivative of state vector (deformation rate, probe velocity)
+        """
+        # unpack state
+        u, h0 = state
+        h0 = h0[0]
+        # calculate gap
+        h = self.calculate_gap(u, h0)
+        # calculate surface pressure and derivative
+        p, p_h = self.p_func(h, *self.args)
+        # use estimate for h_dot to get the fluid pressure
+        h_dot = (h - h_prev) / dt
+        # calculate the fluid pressure
+        p_fluid = self.calc_fluid_pressure(self.h0, h, h_dot)
+        # calculate the fluid pressure gradient
+        p_fluid_h = self.calc_fluid_pressure_gradient(p_fluid, h)
+        # determine total pressure
+        p_total = p + p_fluid
+        p_h_total = p_h + p_fluid_h
+        # begin iteration loop
+        num_iters = 0
+        err = np.inf
+        while num_iters < max_iter and err > tol:
+            # calculate lhs integral operator as a matrix
+            lhs = self.c1 * self.dr * self.k_ij * p_h_total * self.r - self.b1 * self.I
+            # calculate the rhs source term
+            rhs = self.c1 * self.v_tip * self.dr * (p_h_total * self.r) @ self.k_ij + self.c0 * self.dr * (p_total * self.r) @ self.k_ij + self.b0 * u
+            # invert the equation to obtain the derivative of u
+            u_dot = np.linalg.solve(lhs, rhs)
+            # iterate if needed
+            if not iterate:
+                break
+            num_iters += 1
+            # calculate the new h_dot
+            h_dot = (self.v_tip - u_dot) * wf + (1 - wf) * h_dot  # weighted average of the old and new h_dot
+            # calculate the fluid pressure
+            p_fluid_new = self.calc_fluid_pressure(self.h0, h, h_dot)
+            # calculate the fluid pressure gradient
+            p_fluid_h_new = self.calc_fluid_pressure_gradient(p_fluid, h)
+            # calculate the error
+            err = np.linalg.norm(p_fluid_new - p_fluid) / np.linalg.norm(p_fluid) + np.linalg.norm(p_fluid_h_new - p_fluid_h) / np.linalg.norm(p_fluid_h)
+            p_fluid = p_fluid_new.copy()
+            p_fluid_h = p_fluid_h_new.copy()
+            # determine total pressure
+            p_total = p + p_fluid
+            p_h_total = p_h + p_fluid_h
+        return np.array([u_dot, self.v_tip]), (h_dot, num_iters, err)
+    
+    
+    def rk4_v2(self, state, h_prev, iterate=False, max_iter=100, tol=1e-6, wf=1):
+        """4th order Runge-Kutta time stepping scheme
+
+        Args:
+            state (numpy array): state vector (deformation, separation in our case)
+
+        Returns:
+            numpy array: state vector derivative (deformation rate, probe velocity in our case), extra values from rhs calculation (pressure, gap in our case)
+        """
+        k1, (h_dot1, i1, e1) = self.rhs_semi_iter(state, h_prev, self.dt, iterate, max_iter, tol, wf)
+        k2, (h_dot2, i2, e2) = self.rhs_semi_iter(state + k1 * self.dt / 2, h_prev, self.dt / 2, iterate, max_iter, tol, wf)
+        k3, (h_dot3, i3, e3) = self.rhs_semi_iter(state + k2 * self.dt / 2, h_prev, self.dt / 2, iterate, max_iter, tol, wf)
+        k4, (h_dot4, i4, e4) = self.rhs_semi_iter(state + k3 * self.dt, h_prev, self.dt, iterate, max_iter, tol, wf)
+        return state + (k1 + 2 * k2 + 2 * k3 + k4) * self.dt / 6, ((h_dot1 + h_dot2 * 2 + h_dot3 * 2 + h_dot4) / 6, i1 + i2 * 2 + i3 * 2 + i4, e1 + e2 * 2 + e3 * 2 + e4)
+
+    
+    def solve(self, iterate=False, max_iter=100, tol=1e-6, wf=1):
+        """solve the solid ODE using the implicit time stepping routine
+
+        Returns:
+            dict: solution dict containing all the relevant information
+        """
+        # make loggers
+        self.make_loggers()
+        self.force_fluid = np.zeros(self.nt)
+        self.force_surface = np.zeros(self.nt)
+        self.conv_iters = np.zeros(self.nt)
+        self.conv_error = np.zeros(self.nt)
+        # log fields if necessary
+        if self.log_all:
+            self.make_field_loggers()
+            self.P_surface = np.zeros((self.nt, self.r.size))
+            self.P_fluid = np.zeros((self.nt, self.r.size))
+        # make solid deformation field
+        u = np.zeros(self.r.size)
+        h = self.calculate_gap(u, self.h0)
+        state = np.array([u, self.h0])
+
+        for i in range(self.nt):
+            # need to find good way to calculate h_dot for each rk4 step
+            h_prev = h.copy()
+            # perform update using rk4
+            state, (h_dot, num_iters, err) = self.rk4_v2(state, h_prev, iterate=iterate, max_iter=max_iter, tol=tol, wf=wf)
+            u, self.h0 = state
+            # calculate gap
+            h = self.calculate_gap(u, self.h0)
+            # calculate surface pressure
+            p, _ = self.p_func(h, *self.args)
+            # calculate fluid pressure
+            p_fluid = self.calc_fluid_pressure(self.h0, h, h_dot)
+            # determine total pressure
+            p_total = p + p_fluid
+            # calculate observables
+            self.force[i] = self.calculate_force(p_total)
+            self.force_fluid[i] = self.calculate_force(p_fluid)
+            self.force_surface[i] = self.calculate_force(p)
+            self.conv_iters[i] = num_iters
+            self.conv_error[i] = err
+            self.deformation[i] = u[0]
+            self.position[i] = self.h0[0]
+            self.separation[i] = h[0]
+            self.time[i] = i * self.dt
+            # log to console
+            self.console_log(i)
+            # log fields if necessary
+            if self.log_all:
+                self.U[i] = u
+                self.H[i] = h
+                self.P[i] = p_total
+                self.P_fluid[i] = p_fluid
+                self.P_surface[i] = p
+            # early stopping conditions
+            if self.h0[0] <= self.h0_target:
+                self.force_fluid = self.force_fluid[:i]
+                self.force_surface = self.force_surface[:i]
+                self.conv_iters = self.conv_iters[:i]
+                self.conv_error = self.conv_error[:i]
+                self.force = self.force[:i]
+                self.deformation = self.deformation[:i]
+                self.position = self.position[:i]
+                self.separation = self.separation[:i]
+                self.time = self.time[:i]
+                if self.log_all:
+                    self.U = self.U[:i]
+                    self.H = self.H[:i]
+                    self.P = self.P[:i]
+                    self.P_fluid = self.P_fluid[:i]
+                    self.P_surface = self.P_surface[:i]
+                break
+        # return solution data
+        sol_df = pd.DataFrame({'time': self.time, 'force': self.force, 'deformation': self.deformation, 'position': self.position, 'separation': self.separation,
+                               'force_fluid': self.force_fluid, 'force_surface': self.force_surface, 'conv_iters': self.conv_iters, 'conv_error': self.conv_error})
+        self.solution['data'] = sol_df
+        if self.log_all:
+            self.solution['field_variables'] = {'U': self.U, 'H': self.H, 'P': self.P, 'r': self.r, 't': self.time, 'P_fluid': self.P_fluid, 'P_surface': self.P_surface}
+        print('done! returning solution, it is also saved as self.solution')
+        return self.solution
+    
