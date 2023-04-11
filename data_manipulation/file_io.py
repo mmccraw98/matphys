@@ -193,7 +193,7 @@ def load(file_path):
         raise ValueError(f"Error loading data from file '{file_path}': {e}")
 
 
-def save(data, file_path, file_type, overwrite=False):
+def save(data, file_path, file_type, overwrite=False, lock=False):
     """
     Save data to a file in a specified format.
 
@@ -207,6 +207,8 @@ def save(data, file_path, file_type, overwrite=False):
         The file type to use for saving the data.
     overwrite : bool, optional
         Whether to allow overwriting existing files (default is False).
+    lock : bool, optional
+        if true, no overwriting will be allowed, neither will a new file be created (default is False).
 
     Raises
     ------
@@ -219,6 +221,8 @@ def save(data, file_path, file_type, overwrite=False):
 
         # If the file already exists and overwrite is False, get the next free file path
         if os.path.exists(file_path) and not overwrite:
+            if lock:
+                raise ValueError(f"File '{file_path}' already exists")
             file_path = next_path(file_path)
 
         if file_type == 'pkl':
