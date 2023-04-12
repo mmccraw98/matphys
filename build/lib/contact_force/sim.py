@@ -1759,6 +1759,9 @@ class ContactSimOdeFluid(ContactSimOde):
         # making vectors
         self.v_tip = np.ones(self.r.shape) * self.v_tip
         self.h0 = np.ones(self.r.shape) * self.h0
+        # self explanatory warning
+        if self.r[-1] < self.R * (1 / 5) ** (1 / 2):
+            print('there might be an issue when indenting due to the brenner asymptotic correction')
 
     def console_log(self, step):
         """log the simulation to the console at the specified step
@@ -1826,6 +1829,22 @@ class ContactSimOdeFluid(ContactSimOde):
         spline = splrep(self.r[:-1], p_fluid_h_numerical[:-1])
         p_fluid_h_numerical[-1] = splev(self.r[-1], spline)
         return p_fluid_h_numerical
+    
+    def brenner_asymptotic_force_finite_domain_correction(self, h0):
+        """order of magnitude correction factor for the part of the domain for r[-1] to infinity, obtained by assuming the deformation is 0 beyond r[-1], 
+        and integrating the brenner pressure from r[-1] to infinity. this can cause issues if the probe is indented beyond (1/5)^(1/2) * R, 
+        it is useful as the pressure is fat-tailed, so if we enforced p_fluid(r[-1])=0, as is common, we would lose the force contribution from the fluid at large r
+
+        Args:
+            h0 (float): equilibrium separation between the probe and the surface
+
+        Returns:
+            float: force correction
+        """
+        # obtained by assuming deformation is 0 at r_max and solving for the pressure using the
+        # brenner solution for the fluid pressure and then integrating the brenner pressure
+        # from r_max to infinity in the force integral to obtain the correction
+        return -12 * self.eta * self.v_tip * self.R ** 3 / (self.r[-1] ** 2 + 2 * h0 * self.R)
     
     
     def rhs_semi_iter(self, state, h_prev, dt, iterate=False, max_iter=100, tol=1e-6, wf=1):
@@ -1899,7 +1918,7 @@ class ContactSimOdeFluid(ContactSimOde):
         return state + (k1 + 2 * k2 + 2 * k3 + k4) * self.dt / 6, ((h_dot1 + h_dot2 * 2 + h_dot3 * 2 + h_dot4) / 6, i1 + i2 * 2 + i3 * 2 + i4, e1 + e2 * 2 + e3 * 2 + e4)
 
     
-    def solve(self, iterate=False, max_iter=100, tol=1e-6, wf=1):
+    def solve(self, iterate=False, max_iter=100, tol=1e-6, wf=1, finite_domain_correction=False):
         """solve the solid ODE using the implicit time stepping routine
 
         Returns:
@@ -1939,6 +1958,11 @@ class ContactSimOdeFluid(ContactSimOde):
             self.force[i] = self.calculate_force(p_total)
             self.force_fluid[i] = self.calculate_force(p_fluid)
             self.force_surface[i] = self.calculate_force(p)
+            # calculate finite domain fluid pressure correction if needed
+            if finite_domain_correction:
+                fluid_force_correction = self.brenner_asymptotic_force_finite_domain_correction(self.h0)[0]
+                self.force_fluid[i] += fluid_force_correction
+                self.force[i] += fluid_force_correction
             self.conv_iters[i] = num_iters
             self.conv_error[i] = err
             self.deformation[i] = u[0]
