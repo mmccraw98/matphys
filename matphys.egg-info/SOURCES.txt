@@ -1,8 +1,10 @@
+README.md
 setup.py
 contact_force/__init__.py
 contact_force/funcs.py
 contact_force/sim.py
 data_manipulation/__init__.py
+data_manipulation/afm_fd.py
 data_manipulation/file_io.py
 data_manipulation/test_data_manupulation.py
 matphys.egg-info/PKG-INFO

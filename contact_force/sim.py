@@ -1754,6 +1754,7 @@ class ContactSimOdeFluid(ContactSimOde):
         """        
         super().__init__(Gg, Ge, Tau, poissons, R, v_tip, h0, h0_target, p_func, *args, nr=nr, dr_factor=dr_factor, dt_factor=step_size, nt=nt, log_all=log_all, pct_log=pct_log)
         self.h_target = h_target
+        self.u_target = u_target
         # define the fluid viscosity
         self.eta = eta
         self.solution['eta'] = self.eta
@@ -1980,7 +1981,7 @@ class ContactSimOdeFluid(ContactSimOde):
                 self.P_fluid[i] = p_fluid
                 self.P_surface[i] = p
             # early stopping conditions
-            if self.h0[0] <= self.h0_target or any(h < self.h_target) or any(abs(u) > self.u_max):
+            if self.h0[0] <= self.h0_target or any(h < self.h_target) or any(abs(u) > self.u_target):
                 self.force_fluid = self.force_fluid[:i]
                 self.force_surface = self.force_surface[:i]
                 self.conv_iters = self.conv_iters[:i]
