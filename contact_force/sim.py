@@ -1721,7 +1721,7 @@ class ContactSimOde(ContactSim):
     
 class ContactSimOdeFluid(ContactSimOde):
     
-    def __init__(self, Gg, Ge, Tau, poissons, R, v_tip, h0, h0_target, eta, p_func, *args, nr=int(1e3), dr_factor=1.1, step_size=1e-10, nt=int(1e6), log_all=False, pct_log=0.1, h_target=0):
+    def __init__(self, Gg, Ge, Tau, poissons, R, v_tip, h0, h0_target, eta, p_func, *args, nr=int(1e3), dr_factor=1.1, step_size=1e-10, nt=int(1e6), log_all=False, pct_log=0.1, h_target=0, u_target=np.inf):
         """solve the solid PDE using an implicit time stepping routine for the itneraction of a rigid, spherical probe with a semi-infinite,
         linear elastic or linear viscoelastic half-space.  the scheme is based on a generalization of Attard's equation and Rajabifar's solution
         The primary assumption is that the initial separation and the maximum deformation are smaller than the probe radius, so that the Derjaguin
@@ -1746,6 +1746,7 @@ class ContactSimOdeFluid(ContactSimOde):
             log_all (bool, optional): whether to log field variables. Defaults to False.
             pct_log (float, optional): defines frequency of console logging as a percent of the total estimated number of steps. Defaults to 0.1.
             h_target (float, optional): defines the target separation between the probe and the surface. Defaults to 0.
+            u_target (float, optional): defines the target deformation of the probe. Defaults to np.inf.
 
         Raises:
             ValueError: if the target probe position is less than -R/10, the simulation will not be valid
@@ -1979,7 +1980,7 @@ class ContactSimOdeFluid(ContactSimOde):
                 self.P_fluid[i] = p_fluid
                 self.P_surface[i] = p
             # early stopping conditions
-            if self.h0[0] <= self.h0_target or any(h < self.h_target):
+            if self.h0[0] <= self.h0_target or any(h < self.h_target) or any(abs(u) > self.u_max):
                 self.force_fluid = self.force_fluid[:i]
                 self.force_surface = self.force_surface[:i]
                 self.conv_iters = self.conv_iters[:i]
