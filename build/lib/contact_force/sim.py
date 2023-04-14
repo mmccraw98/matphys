@@ -1920,12 +1920,16 @@ class ContactSimOdeFluid(ContactSimOde):
         return state + (k1 + 2 * k2 + 2 * k3 + k4) * self.dt / 6, ((h_dot1 + h_dot2 * 2 + h_dot3 * 2 + h_dot4) / 6, i1 + i2 * 2 + i3 * 2 + i4, e1 + e2 * 2 + e3 * 2 + e4)
 
     
-    def solve(self, iterate=False, max_iter=100, tol=1e-6, wf=1, finite_domain_correction=False):
+    def solve(self, iterate=False, max_iter=100, tol=1e-6, wf=1, finite_domain_correction=False, dynamic_dt=False):
         """solve the solid ODE using the implicit time stepping routine
 
         Returns:
             dict: solution dict containing all the relevant information
         """
+        # configure dynamic time step
+        if dynamic_dt:
+            self.dt_max = self.dt
+            self.stability_factor = 1e3  # the product of max(p_h)/Gg * dt should be less than this
         # make loggers
         self.make_loggers()
         self.force_fluid = np.zeros(self.nt)
@@ -1951,7 +1955,11 @@ class ContactSimOdeFluid(ContactSimOde):
             # calculate gap
             h = self.calculate_gap(u, self.h0)
             # calculate surface pressure
-            p, _ = self.p_func(h, *self.args)
+            p, p_h = self.p_func(h, *self.args)
+            # considering only the surface pressure gradient, adjust the timestep to promote stability
+            if dynamic_dt:
+                if self.dt < 1e3 * self.a1 / max(p_h):  # turn it on
+                    self.dt = min(self.dt_max, 1e3 * self.a1 / max(p_h))
             # calculate fluid pressure
             p_fluid = self.calc_fluid_pressure(self.h0, h, h_dot)
             # determine total pressure
