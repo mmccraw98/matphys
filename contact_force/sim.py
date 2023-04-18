@@ -2014,3 +2014,61 @@ class ContactSimOdeFluid(ContactSimOde):
         print('done! returning solution, it is also saved as self.solution')
         return self.solution
     
+class ContactSimOdeFluid2(ContactSimOdeFluid):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+    
+    def rhs_semi_iter(self, state, h_prev, dt, iterate=False, max_iter=100, tol=1e-6, wf=1):
+        """calculate the right hand side of the solid ODE
+
+        Args:
+            state (numpy array): deformation and separation between the probe and the equilibrium position of the surface at r=0 (i.e. global position of the tip of the probe)
+
+        Returns:
+            numpy array: derivative of state vector (deformation rate, probe velocity)
+        """
+        # unpack state
+        u, h0 = state
+        h0 = h0[0]
+        # calculate gap
+        h = self.calculate_gap(u, h0)
+        # calculate surface pressure and derivative
+        p, p_h = self.p_func(h, *self.args)
+        # use estimate for h_dot to get the fluid pressure
+        h_dot = (h - h_prev) / dt
+        # calculate the fluid pressure
+        p_fluid = self.calc_fluid_pressure(self.h0, h, h_dot)
+        # calculate the fluid pressure gradient
+        p_fluid_h = self.calc_fluid_pressure_gradient(p_fluid, h)
+        # determine total pressure
+        p_total = p + p_fluid
+        p_h_total = p_h + p_fluid_h
+        # begin iteration loop
+        num_iters = 0
+        err = np.inf
+        while num_iters < max_iter and err > tol:
+            # calculate lhs integral operator as a matrix
+            lhs = self.c1 * self.dr * self.k_ij * p_h_total * self.r - self.b1 * self.I
+            # calculate the rhs source term
+            rhs = self.c1 * self.v_tip * self.dr * (p_h_total * self.r) @ self.k_ij + self.c0 * self.dr * (p_total * self.r) @ self.k_ij + self.b0 * u
+            # invert the equation to obtain the derivative of u
+            u_dot = np.linalg.solve(lhs, rhs)
+            # iterate if needed
+            if not iterate:
+                break
+            num_iters += 1
+            # calculate the new h_dot
+            h_dot = (self.v_tip - u_dot) * wf + (1 - wf) * h_dot  # weighted average of the old and new h_dot
+            # calculate the fluid pressure
+            p_fluid_new = self.calc_fluid_pressure(self.h0, h, h_dot)
+            # calculate the fluid pressure gradient
+            p_fluid_h_new = self.calc_fluid_pressure_gradient(p_fluid, h)
+            # calculate the error
+            err = np.mean((p_fluid_new - p_fluid) / (6 * np.pi * abs(self.eta * self.v_tip[0] * self.R)))
+            p_fluid = p_fluid_new.copy()
+            p_fluid_h = p_fluid_h_new.copy()
+            # determine total pressure
+            p_total = p + p_fluid
+            p_h_total = p_h + p_fluid_h
+        return np.array([u_dot, self.v_tip]), (h_dot, num_iters, err)
+    
