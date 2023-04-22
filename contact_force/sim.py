@@ -376,7 +376,7 @@ def get_coefs_gkv(Jg, Je, Tau, v):
     :param v: float poisson's ratio
     :return: b1, b0, c1, c0
     '''
-    return Tau, 1, (1 - v ** 2) * Jg, (1 - v ** 2) * Je
+    return Tau, 1, (1 - v ** 2) * Jg * Tau, (1 - v ** 2) * Je
 
 
 def get_explicit_sim_arguments(l, f, rho_c, R, G_star, N_R, H_R_target=-0.1, F_target=1):
