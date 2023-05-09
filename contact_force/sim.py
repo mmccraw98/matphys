@@ -1849,6 +1849,29 @@ class ContactSimOdeFluid(ContactSimOde):
         return -12 * self.eta * self.v_tip * self.R ** 3 / (self.r[-1] ** 2 + 2 * h0 * self.R)
     
     
+    def rhs_elastic_iter(self, u, h0, h_prev, dt, E_star, max_iter=100, tol=1e-6, wf=1):
+        h0 = h0[0]
+        u_prev = u.copy()
+        h = self.calculate_gap(u, h0)
+        p_surface, _ = self.p_func(h, *self.args)
+        h_dot = (h - h_prev) / dt
+        p_fluid = self.calc_fluid_pressure(self.h0, h, h_dot)
+        p_total = p_surface + p_fluid
+        num_iters = 0
+        err = np.inf
+        while num_iters < max_iter and err > tol:
+            num_iters += 1
+            u_new = - 1 / E_star * self.dr * self.k_ij @ (p_total * self.r)
+            u_dot = (u_new - u_prev) / dt
+            h_dot = (self.v_tip - u_dot) * wf + (1 - wf) * h_dot  # weighted average of the old and new h_dot
+            p_fluid = self.calc_fluid_pressure(self.h0, h, h_dot)
+            p_total = p_surface + p_fluid
+            err = np.mean(abs(u_new - u_prev))
+            u_prev = u_new.copy()
+        return u_new, p_total, p_fluid, p_surface, num_iters, err
+            
+            
+    
     def rhs_semi_iter(self, state, h_prev, dt, iterate=False, max_iter=100, tol=1e-6, wf=1):
         """calculate the right hand side of the solid ODE
 
@@ -1918,6 +1941,79 @@ class ContactSimOdeFluid(ContactSimOde):
         k3, (h_dot3, i3, e3) = self.rhs_semi_iter(state + k2 * self.dt / 2, h_prev, self.dt / 2, iterate, max_iter, tol, wf)
         k4, (h_dot4, i4, e4) = self.rhs_semi_iter(state + k3 * self.dt, h_prev, self.dt, iterate, max_iter, tol, wf)
         return state + (k1 + 2 * k2 + 2 * k3 + k4) * self.dt / 6, ((h_dot1 + h_dot2 * 2 + h_dot3 * 2 + h_dot4) / 6, i1 + i2 * 2 + i3 * 2 + i4, e1 + e2 * 2 + e3 * 2 + e4)
+
+    
+    def solve_elastic(self, E_star, max_iter=100, tol=1e-6, wf=1, finite_domain_correction=False):
+        # make loggers
+        self.make_loggers()
+        self.force_fluid = np.zeros(self.nt)
+        self.force_surface = np.zeros(self.nt)
+        self.conv_iters = np.zeros(self.nt)
+        self.conv_error = np.zeros(self.nt)
+        # log fields if necessary
+        if self.log_all:
+            self.make_field_loggers()
+            self.P_surface = np.zeros((self.nt, self.r.size))
+            self.P_fluid = np.zeros((self.nt, self.r.size))
+        # make solid deformation field
+        u = np.zeros(self.r.size)
+        h = self.calculate_gap(u, self.h0)
+        for i in range(self.nt):
+            h_prev = h.copy()
+            u, p_total, p_fluid, p_surface, num_iters, err = self.rhs_elastic_iter(u, self.h0, h_prev, self.dt, E_star, max_iter, tol, wf)
+            h = self.calculate_gap(u, self.h0)
+            h_prev = h.copy()
+            self.h0 += self.v_tip * self.dt
+            # calculate observables
+            self.force[i] = self.calculate_force(p_total)
+            self.force_fluid[i] = self.calculate_force(p_fluid)
+            self.force_surface[i] = self.calculate_force(p_surface)
+            # calculate finite domain fluid pressure correction if needed
+            if finite_domain_correction:
+                fluid_force_correction = self.brenner_asymptotic_force_finite_domain_correction(self.h0)[0]
+                self.force_fluid[i] += fluid_force_correction
+                self.force[i] += fluid_force_correction
+            self.conv_iters[i] = num_iters
+            self.conv_error[i] = err
+            self.deformation[i] = u[0]
+            self.position[i] = self.h0[0]
+            self.separation[i] = h[0]
+            self.time[i] = i * self.dt
+            # log to console
+            self.console_log(i)
+            # log fields if necessary
+            if self.log_all:
+                self.U[i] = u
+                self.H[i] = h
+                self.P[i] = p_total
+                self.P_fluid[i] = p_fluid
+                self.P_surface[i] = p_surface
+            # early stopping conditions
+            if self.h0[0] <= self.h0_target or any(h < self.h_target) or any(abs(u) > self.u_target) or self.conv_error[i] >= tol or self.conv_iters[i] >= max_iter or np.isnan(self.force[i]):
+                self.force_fluid = self.force_fluid[:i]
+                self.force_surface = self.force_surface[:i]
+                self.conv_iters = self.conv_iters[:i]
+                self.conv_error = self.conv_error[:i]
+                self.force = self.force[:i]
+                self.deformation = self.deformation[:i]
+                self.position = self.position[:i]
+                self.separation = self.separation[:i]
+                self.time = self.time[:i]
+                if self.log_all:
+                    self.U = self.U[:i]
+                    self.H = self.H[:i]
+                    self.P = self.P[:i]
+                    self.P_fluid = self.P_fluid[:i]
+                    self.P_surface = self.P_surface[:i]
+                break
+        # return solution data
+        sol_df = pd.DataFrame({'time': self.time, 'force': self.force, 'deformation': self.deformation, 'position': self.position, 'separation': self.separation,
+                               'force_fluid': self.force_fluid, 'force_surface': self.force_surface, 'conv_iters': self.conv_iters, 'conv_error': self.conv_error})
+        self.solution['data'] = sol_df
+        if self.log_all:
+            self.solution['field_variables'] = {'U': self.U, 'H': self.H, 'P': self.P, 'r': self.r, 't': self.time, 'P_fluid': self.P_fluid, 'P_surface': self.P_surface}
+        print('done! returning solution, it is also saved as self.solution')
+        return self.solution
 
     
     def solve(self, iterate=False, max_iter=100, tol=1e-6, wf=1, finite_domain_correction=False, dynamic_dt=False, dynamic_dt_factor=1):
