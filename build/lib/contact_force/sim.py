@@ -2016,6 +2016,116 @@ class ContactSimOdeFluid(ContactSimOde):
         return self.solution
 
     
+    def simple_elastic_solve(self, E, max_iter=10000, tol=1e-11, wf=0.5, finite_domain_correction=True):
+        """solve the solid ODE using the explicit time stepping routine
+
+        Returns:
+            dict: solution dict containing all the relevant information
+        """
+        # make loggers
+        self.make_loggers()
+        self.force_fluid = np.zeros(self.nt)
+        self.force_surface = np.zeros(self.nt)
+        self.conv_iters = np.zeros(self.nt)
+        self.conv_error = np.zeros(self.nt)
+        # log fields if necessary
+        if self.log_all:
+            self.make_field_loggers()
+            self.P_surface = np.zeros((self.nt, self.r.size))
+            self.P_fluid = np.zeros((self.nt, self.r.size))
+        # make solid deformation field
+        u = np.zeros(self.r.size)
+        h = self.calculate_gap(u, self.h0)
+        h_dot = np.zeros(self.r.size) + self.v_tip
+        v_tip = self.v_tip[0]
+        eta = self.eta
+        r = self.r.copy()
+        k_ij = self.k_ij.copy()
+        R = self.R
+        dr = self.dr
+        dt = self.dt
+        
+        def compute_p(h0, h, h_dot, r, eta, v_tip, R):
+            interm1 = cumtrapz(12 * eta * r * h_dot, r, initial=0)
+            p_fluid = cumtrapz(interm1 / (r * h ** 3), r, initial=0)
+            p_fluid -= p_fluid[-1]  # old way
+            p_fluid += p_brenner(h0 + r[-1] ** 2 / (2 * R), v_tip, eta, R)[0]
+            return p_fluid
+
+        for i in range(self.nt):
+            # iterate
+            for _ in range(max_iter):
+                h = self.h0 + r ** 2 / (2 * R) - u
+                p = compute_p(self.h0, h, h_dot, r, eta, v_tip, R)
+                u_new = - (1 - 0.5 ** 2) / E * dr * k_ij @ (p * r)
+                u_dot = (u_new - u) / dt
+                h_dot_new = v_tip - u_dot
+                err = np.linalg.norm(h_dot - h_dot_new)
+                if err < tol:
+                    h_dot = h_dot_new
+                    break
+                h_dot = (1 - wf) * h_dot + wf * h_dot_new  # underrelaxation step
+                converged = True
+            else:
+                converged = False
+            
+            # Euler's time-stepping
+            h += dt * h_dot
+            u += dt * u_dot
+            self.h0 += dt * v_tip
+
+            # calculate observables
+            self.force[i] = self.calculate_force(p)
+            self.force_fluid[i] = self.calculate_force(p)
+            self.force_surface[i] = self.calculate_force(p * 0)
+            # calculate finite domain fluid pressure correction if needed
+            if finite_domain_correction:
+                fluid_force_correction = self.brenner_asymptotic_force_finite_domain_correction(self.h0)[0]
+                self.force_fluid[i] += fluid_force_correction
+                self.force[i] += fluid_force_correction
+            self.conv_iters[i] = _
+            self.conv_error[i] = err
+            self.deformation[i] = u[0]
+            self.position[i] = self.h0[0]
+            self.separation[i] = h[0]
+            self.time[i] = i * self.dt
+            # log to console
+            self.console_log(i)
+            # log fields if necessary
+            if self.log_all:
+                self.U[i] = u
+                self.H[i] = h
+                self.P[i] = p
+                self.P_fluid[i] = p
+                self.P_surface[i] = p * 0
+            # early stopping conditions
+            if self.h0[0] <= self.h0_target or any(h < self.h_target) or any(abs(u) > self.u_target):
+                self.force_fluid = self.force_fluid[:i]
+                self.force_surface = self.force_surface[:i]
+                self.conv_iters = self.conv_iters[:i]
+                self.conv_error = self.conv_error[:i]
+                self.force = self.force[:i]
+                self.deformation = self.deformation[:i]
+                self.position = self.position[:i]
+                self.separation = self.separation[:i]
+                self.time = self.time[:i]
+                if self.log_all:
+                    self.U = self.U[:i]
+                    self.H = self.H[:i]
+                    self.P = self.P[:i]
+                    self.P_fluid = self.P_fluid[:i]
+                    self.P_surface = self.P_surface[:i]
+                break
+        # return solution data
+        sol_df = pd.DataFrame({'time': self.time, 'force': self.force, 'deformation': self.deformation, 'position': self.position, 'separation': self.separation,
+                               'force_fluid': self.force_fluid, 'force_surface': self.force_surface, 'conv_iters': self.conv_iters, 'conv_error': self.conv_error})
+        self.solution['data'] = sol_df
+        if self.log_all:
+            self.solution['field_variables'] = {'U': self.U, 'H': self.H, 'P': self.P, 'r': self.r, 't': self.time, 'P_fluid': self.P_fluid, 'P_surface': self.P_surface}
+        print('done! returning solution, it is also saved as self.solution')
+        return self.solution
+    
+    
     def solve(self, iterate=False, max_iter=100, tol=1e-6, wf=1, finite_domain_correction=False, dynamic_dt=False, dynamic_dt_factor=1):
         """solve the solid ODE using the implicit time stepping routine
 
