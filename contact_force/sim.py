@@ -758,7 +758,7 @@ def rhs_mixed(state_vectors, state_scalars, t, b1, b0, c1, c0, r, dr, R, k_ij, I
 
 def simulate_cantilever_N1(Gg, Ge, Tau, v, zt, vt, zb, R, f_exc_func, vb_func, p_func, *args,
                            nr=int(1e3), dr=1.5e-9, dt_factor=1e-10, nt=int(1e6), w0=10e3, Q0=100, k_eff=1,
-                           force_target=1e-6, pos_target=-1e-8, pct_log=0.0001, use_cuda=False, log_all=False):
+                           force_target=np.inf, pos_target=-1e-8, pct_log=0.0001, use_cuda=False, log_all=False):
     '''
     integrate the interaction of the probe (connected to a SHO cantilever) with a sample defined by a viscoelastic
     ODE of maximum order N=1, using RK4 time integration
@@ -905,6 +905,18 @@ def simulate_cantilever_N1(Gg, Ge, Tau, v, zt, vt, zb, R, f_exc_func, vb_func, p
             P_log[n] = extra_vectors[0]
             H_log[n] = extra_vectors[1]
             r_log[n] = r
+        if zb_zt_vt[n, 0] < pos_target or f_ts_f_exc_at[n, 0] > force_target:
+            zb_zt_vt = zb_zt_vt[:n + 1]
+            f_ts_f_exc_at = f_ts_f_exc_at[:n + 1]
+            central_deformation = central_deformation[:n + 1]
+            time = time[:n + 1]
+            u_inf = u_inf[:n + 1]
+            if log_all:
+                U_log = U_log[:n + 1]
+                P_log = P_log[:n + 1]
+                H_log = H_log[:n + 1]
+                r_log = r_log[:n + 1]
+            break
     if use_cuda:
         zb_zt_vt = zb_zt_vt.cpu().numpy()
         f_ts_f_exc_at = f_ts_f_exc_at.cpu().numpy()
