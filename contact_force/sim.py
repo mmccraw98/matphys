@@ -757,7 +757,7 @@ def rhs_mixed(state_vectors, state_scalars, t, b1, b0, c1, c0, r, dr, R, k_ij, I
         return (u_dot, np.array([zb_dot, zt_dot, vt_dot]), (p, h), np.array([f_ts, f_exc, vt_dot]))
 
 def simulate_cantilever_N1(Gg, Ge, Tau, v, zt, vt, zb, R, f_exc_func, vb_func, p_func, *args,
-                           nr=int(1e3), dr=1.5e-9, dt=1e-4, nt=int(1e6), w0=10e3, Q0=100, k_eff=1,
+                           nr=int(1e3), dr=1.5e-9, dt_factor=1e-10, nt=int(1e6), w0=10e3, Q0=100, k_eff=1,
                            force_target=1e-6, pos_target=-1e-8, pct_log=0.0001, use_cuda=False, log_all=False):
     '''
     integrate the interaction of the probe (connected to a SHO cantilever) with a sample defined by a viscoelastic
@@ -786,6 +786,7 @@ def simulate_cantilever_N1(Gg, Ge, Tau, v, zt, vt, zb, R, f_exc_func, vb_func, p
     :param log_all: bool whether to log surface distribution data, default is False
     :return: data dict containing sim dataframe and sim parameters
     '''
+    dt = abs(dt_factor / vt)
     saved_args = locals()  # save all function arguments for later
     # discretize domain
     r = np.linspace(1, nr, nr) * dr
@@ -1666,7 +1667,7 @@ class ContactSimOde(ContactSim):
         k4, extra = self.rhs(state + k3 * self.dt)
         return state + (k1 + 2 * k2 + 2 * k3 + k4) * self.dt / 6, extra
     
-    def solve(self):
+    def solve(self, h_target=0, u_target=np.inf):
         """solve the solid ODE using the implicit time stepping routine
 
         Returns:
@@ -1700,7 +1701,7 @@ class ContactSimOde(ContactSim):
                 self.H[i] = h
                 self.P[i] = p
             # early stopping conditions
-            if self.h0 <= self.h0_target:
+            if self.h0 <= self.h0_target or np.any(h <= h_target) or np.any(abs(u) >= abs(u_target)):
                 self.force = self.force[:i]
                 self.deformation = self.deformation[:i]
                 self.position = self.position[:i]
