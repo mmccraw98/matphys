@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import os
 import pickle
-import igor
+from igor.binarywave import load as loadibw
 
 def next_path(path_pattern):
     """
@@ -109,7 +109,7 @@ def process_notes(notes):
 
 def ibw2dict(filename):
     """Extract the contents of an *ibw to a dict"""
-    data = igor.binarywave.load(filename)
+    data = loadibw(filename)
     wave = data['wave']
 
     # Get the labels and tidy them up into a list
